@@ -43,3 +43,22 @@ class MovementIn(Input):
 
 class NamedIn(Input):
     name: str = Field(min_length=1, max_length=150)
+
+class ProfileIn(Input):
+    first_name: str = Field(min_length=1, max_length=100)
+    last_name: str = Field(min_length=1, max_length=100)
+
+class UserUpdate(ProfileIn):
+    email: EmailStr
+    role: Literal['Admin','Storekeeper','Manager']
+    active: bool = Field(strict=True)
+
+class PasswordIn(Input):
+    old_password: str = Field(min_length=1, max_length=128)
+    new_password: str = Field(min_length=8, max_length=128)
+    @field_validator('new_password')
+    @classmethod
+    def strong(cls, value):
+        if not password_policy(value):
+            raise ValueError('Пароль має містити великі й малі літери, цифру та спеціальний символ')
+        return value

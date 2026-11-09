@@ -11,15 +11,15 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from .database import connect
 from .models import User, Category, Supplier, Product, Transaction, RevokedToken, Audit
-from .schemas import Login, UserIn, ProductIn, MovementIn, NamedIn
-from .security import hasher, DUMMY_HASH, make_token, read_token
+from .schemas import Login, UserIn, ProductIn, MovementIn, NamedIn, ProfileIn, UserUpdate, PasswordIn
+from .security import hasher, DUMMY_HASH, make_token, read_token, credential_version
 from .services import check_links, move_stock, inventory_report
 
 bearer = HTTPBearer(auto_error=False)
 log = logging.getLogger('sklad')
 
 def create_app(database_url=None, secret=None):
-    app = FastAPI(title='Sklad.io Warehouse API', version='1.0.0')
+    app = FastAPI(title='Sklad.io Warehouse API', version='1.1.0')
     engine, sessions = connect(database_url or os.getenv('DATABASE_URL','sqlite:///./warehouse.db'))
     app.state.engine = engine
     app.state.sessions = sessions
@@ -68,6 +68,8 @@ def create_app(database_url=None, secret=None):
             user = db.get(User, int(claims['sub']))
             if not user or not user.active:
                 raise ValueError()
+            if claims.get('pwd') != credential_version(user.password_hash):
+                raise ValueError()
             return user
         except (jwt.PyJWTError, ValueError, TypeError):
             raise HTTPException(401,'Потрібна автентифікація')
@@ -99,7 +101,7 @@ def create_app(database_url=None, secret=None):
         user.failures = user.locked_until = 0
         db.add(Audit(user_id=user.id,action='login.success'))
         db.commit()
-        return {'access_token':make_token(user.id, secret),'token_type':'bearer','expires_in':1800}
+        return {'access_token':make_token(user.id, secret, credential_version(user.password_hash)),'token_type':'bearer','expires_in':1800}
     @app.post('/auth/logout', status_code=204)
     def logout(credentials=Depends(bearer), user=Depends(current_user), db=Depends(db_session)):
         claims = read_token(credentials.credentials, secret)
@@ -111,6 +113,23 @@ def create_app(database_url=None, secret=None):
     @app.get('/auth/me')
     def me(user=Depends(current_user)):
         return user_view(user)
+    @app.put('/auth/me')
+    def update_profile(data:ProfileIn, user=Depends(current_user), db=Depends(db_session)):
+        user.first_name=data.first_name
+        user.last_name=data.last_name
+        db.add(Audit(user_id=user.id,action='profile.updated'))
+        db.commit()
+        return user_view(user)
+    @app.post('/auth/password',status_code=204)
+    def change_password(data:PasswordIn, user=Depends(current_user), db=Depends(db_session)):
+        if not hasher.verify(data.old_password,user.password_hash):
+            raise HTTPException(400,'Поточний пароль неправильний')
+        if data.old_password==data.new_password:
+            raise HTTPException(400,'Новий пароль має відрізнятися від поточного')
+        user.password_hash=hasher.hash(data.new_password)
+        db.add(Audit(user_id=user.id,action='password.changed'))
+        db.commit()
+        return Response(status_code=204)
     @app.get('/users')
     def users(user=Depends(admin), db=Depends(db_session)):
         return [user_view(u) for u in db.scalars(select(User).order_by(User.id))]
@@ -120,6 +139,19 @@ def create_app(database_url=None, secret=None):
         values['email']=str(data.email).lower()
         record=User(**values,password_hash=hasher.hash(data.password))
         db.add(record); db.commit(); db.refresh(record)
+        return user_view(record)
+    @app.put('/users/{user_id}')
+    def update_user(user_id:int,data:UserUpdate,user=Depends(admin),db=Depends(db_session)):
+        record=db.get(User,user_id)
+        if not record: raise HTTPException(404,'Користувача не знайдено')
+        if record.id==user.id and (not data.active or data.role!='Admin'):
+            raise HTTPException(409,'Не можна заблокувати власний обліковий запис або змінити власну роль')
+        for key,value in data.model_dump().items():
+            setattr(record,key,str(value).lower() if key=='email' else value)
+        # Explicit administrator activation unlocks an account after failed login attempts.
+        if data.active: record.failures=record.locked_until=0
+        db.add(Audit(user_id=user.id,action='user.updated'))
+        db.commit()
         return user_view(record)
     @app.get('/categories')
     def categories(user=Depends(current_user), db=Depends(db_session)):

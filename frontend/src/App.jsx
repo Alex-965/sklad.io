@@ -1,34 +1,143 @@
-import React, {useState, useEffect} from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { LayoutDashboard, Package, ArrowLeftRight, Users as UsersIcon, Settings as SettingsIcon, FileText, Sun, Moon, Bell, Box, LogOut, Shield, Activity, UserRound, ChevronDown, RefreshCw, Menu, X, Check, CheckCheck, AlertTriangle, ArrowRight, Eye, EyeOff } from 'lucide-react';
+import { request, allProducts, clearSession, roles, fullName, dateTime, API_URL } from './api';
+import { Button } from './ui';
+import { Dashboard, Products, Transactions, Users, Reports, Settings, Profile, Audit, Documentation } from './views';
+import Editor from './editors';
 import './warehouse.css';
-const URL=import.meta.env.VITE_API_URL || (import.meta.env.PROD ? '/api' : 'http://127.0.0.1:8000');
-let token=sessionStorage.getItem('sklad_token');
-async function api(path, method='GET', data) {
-  const r=await fetch(URL+path,{method,headers:{'Content-Type':'application/json',...(token?{Authorization:'Bearer '+token}:{})},...(data?{body:JSON.stringify(data)}:{})});
-  if(r.status===204) return null;
-  const body=await r.json();
-  if(!r.ok) {
-    if(r.status===401) { token=null; sessionStorage.removeItem('sklad_token'); window.dispatchEvent(new Event('unauthorized')); }
-    throw Error(body.message+(body.errors?' — '+body.errors.map(e=>e.field+': '+e.message).join('; '):''));
+
+const initialData = { products: [], transactions: [], users: [], categories: [], suppliers: [] };
+const navigation = [
+  ['dashboard', LayoutDashboard, 'Огляд'], ['products', Package, 'Номенклатура'], ['transactions', ArrowLeftRight, 'Рух товарів'],
+  ['reports', FileText, 'Звіти'], ['users', UsersIcon, 'Користувачі'], ['settings', SettingsIcon, 'Налаштування'],
+];
+function saved(key, fallback) { try { return JSON.parse(localStorage.getItem(key)) ?? fallback; } catch { return fallback; } }
+function save(key, value) { localStorage.setItem(key, JSON.stringify(value)); }
+
+export default function App() {
+  const [user, setUser] = useState(null), [booting, setBooting] = useState(true), [data, setData] = useState(initialData);
+  const [view, setView] = useState(() => saved('sklad.view', 'dashboard')), [lowFilter, setLowFilter] = useState(false);
+  const [preferences, setPreferences] = useState(() => ({ theme: 'dark', compact: false, notifications: true, ...saved('sklad.preferences', {}) }));
+  const [systemDark, setSystemDark] = useState(() => window.matchMedia('(prefers-color-scheme: dark)').matches);
+  const [modal, setModal] = useState(null), [popup, setPopup] = useState(null), [mobileMenu, setMobileMenu] = useState(false);
+  const [toast, setToast] = useState(null), [refreshing, setRefreshing] = useState(false), [loaded, setLoaded] = useState(false), [updated, setUpdated] = useState(null);
+  const [loadError, setLoadError] = useState('');
+  const [clock, setClock] = useState(new Date()), [loginMessage, setLoginMessage] = useState('');
+  const [readNotifications, setReadNotifications] = useState(() => saved('sklad.notifications', {}));
+  const headerRef = useRef(null);
+  const dark = preferences.theme === 'system' ? systemDark : preferences.theme === 'dark';
+  const writable = user && user.role !== 'Manager';
+  const closeModal = useCallback(() => setModal(null), []);
+
+  useEffect(() => {
+    const media = window.matchMedia('(prefers-color-scheme: dark)');
+    const changed = event => setSystemDark(event.matches);
+    media.addEventListener('change', changed); return () => media.removeEventListener('change', changed);
+  }, []);
+  useEffect(() => { document.documentElement.dataset.theme = dark ? 'dark' : 'light'; document.documentElement.dataset.density = preferences.compact ? 'compact' : 'comfortable'; save('sklad.preferences', preferences); }, [dark, preferences]);
+  useEffect(() => { const timer = setInterval(() => setClock(new Date()), 30000); return () => clearInterval(timer); }, []);
+  useEffect(() => {
+    let active = true;
+    if (sessionStorage.getItem('sklad_token')) request('/auth/me').then(value => { if (active) setUser(value); }).catch(() => {}).finally(() => { if (active) setBooting(false); });
+    else setBooting(false);
+    const expired = () => { setUser(null); setData(initialData); setModal(null); setPopup(null); setLoginMessage('Сеанс завершився. Увійдіть знову.'); };
+    window.addEventListener('sklad:expired', expired);
+    return () => { active = false; window.removeEventListener('sklad:expired', expired); };
+  }, []);
+  useEffect(() => {
+    function outside(event) { if (!headerRef.current?.contains(event.target)) setPopup(null); }
+    function escape(event) { if (event.key === 'Escape') { setPopup(null); setMobileMenu(false); } }
+    document.addEventListener('mousedown', outside); document.addEventListener('keydown', escape);
+    return () => { document.removeEventListener('mousedown', outside); document.removeEventListener('keydown', escape); };
+  }, []);
+  useEffect(() => { if (!toast) return; const timer = setTimeout(() => setToast(null), toast.error ? 8000 : 4500); return () => clearTimeout(timer); }, [toast]);
+
+  const refresh = useCallback(async () => {
+    if (!user) return;
+    setRefreshing(true);
+    setLoadError('');
+    try {
+      const me = await request('/auth/me');
+      const [products, transactions, categories, suppliers, users] = await Promise.all([allProducts(), request('/transactions'), request('/categories'), request('/suppliers'), me.role === 'Admin' ? request('/users') : Promise.resolve([])]);
+      setUser(current => current && ['email', 'first_name', 'last_name', 'role'].every(key => current[key] === me[key]) ? current : me);
+      setData({ products, transactions, categories, suppliers, users }); setLoaded(true); setUpdated(new Date());
+    } catch (error) { setLoadError(error.message); throw error; }
+    finally { setRefreshing(false); }
+  }, [user?.id, user?.role]);
+  useEffect(() => { if (user) refresh().catch(e => setToast({ text: e.message, error: true })); }, [refresh]);
+  useEffect(() => { if (user && user.role !== 'Admin' && ['users', 'activity'].includes(view)) setView('dashboard'); }, [user, view]);
+
+  function updatePreference(key, value) { setPreferences(current => ({ ...current, [key]: value })); }
+  function navigate(next, low = false) { setLowFilter(low); setView(next); save('sklad.view', next); setPopup(null); setMobileMenu(false); }
+  async function run(fn, message = 'Операцію виконано') {
+    try { await fn(); setToast({ text: message }); return true; }
+    catch (error) { setToast({ text: error.message, error: true }); return false; }
   }
-  return body;
+  async function logout() {
+    const ok = await run(() => request('/auth/logout', 'POST'), 'Ви вийшли з облікового запису');
+    if (ok) { clearSession(); setUser(null); setData(initialData); setLoaded(false); setPopup(null); setLoginMessage(''); }
+  }
+  const notifications = useMemo(() => preferences.notifications ? data.products.filter(p => p.stock_quantity <= p.min_stock_level).map(p => ({ ...p, notificationKey: `${user?.id}:${p.id}:${p.stock_quantity}:${p.min_stock_level}` })) : [], [data.products, preferences.notifications, user?.id]);
+  const unread = notifications.filter(p => !readNotifications[p.notificationKey]).length;
+  function markRead(keys) { const next = { ...readNotifications }; keys.forEach(key => { next[key] = true; }); setReadNotifications(next); save('sklad.notifications', next); }
+  const date = new Intl.DateTimeFormat('uk-UA', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric', timeZone: 'Europe/Kyiv' }).format(clock);
+
+  if (booting) return <div className="boot-screen"><Brand /><RefreshCw size={22} className="spin" /><p>Відкриваємо робочий простір…</p></div>;
+  if (!user) return <Login dark={dark} toggleTheme={() => updatePreference('theme', dark ? 'light' : 'dark')} message={loginMessage} onLogin={value => { setUser(value); setLoginMessage(''); setLoaded(false); navigate('dashboard'); }} />;
+
+  function content() {
+    const common = { data, user, open: setModal, writable };
+    switch (view) {
+      case 'products': return <Products key={`products-${lowFilter}`} {...common} initialLow={lowFilter} />;
+      case 'transactions': return <Transactions {...common} />;
+      case 'users': return user.role === 'Admin' && <Users {...common} />;
+      case 'reports': return <Reports />;
+      case 'settings': return <Settings {...common} preferences={preferences} updatePreference={updatePreference} />;
+      case 'profile': return <Profile user={user} run={run} refreshUser={setUser} />;
+      case 'security': return <Profile user={user} run={run} security onPasswordChanged={() => { clearSession(); setUser(null); setData(initialData); setLoaded(false); setLoginMessage('Пароль змінено. Увійдіть із новим паролем.'); }} />;
+      case 'activity': return user.role === 'Admin' && <Audit data={data} />;
+      case 'documentation': return <Documentation />;
+      default: return <Dashboard {...common} navigate={navigate} />;
+    }
+  }
+
+  return <div className="app-layout">
+    {mobileMenu && <button className="sidebar-scrim" aria-label="Закрити меню" onClick={() => setMobileMenu(false)} />}
+    <aside className={`sidebar ${mobileMenu ? 'mobile-open' : ''}`}>
+      <div className="sidebar-brand"><Brand /><span className="workspace-tag">WORKSPACE</span></div>
+      <div className="workspace-card"><span className="workspace-icon"><Box size={19} /></span><div><strong>Основний склад</strong><small>Робочий простір Sklad.io</small></div><span className="live-dot" /></div>
+      <div className="nav-label">РОБОЧИЙ ПРОСТІР</div>
+      <nav aria-label="Головне меню">{navigation.filter(([id]) => id !== 'users' || user.role === 'Admin').map(([id, Icon, label]) => <button key={id} aria-label={label} onClick={() => navigate(id)} className={view === id ? 'selected' : ''} aria-current={view === id ? 'page' : undefined}><Icon size={18} /><span>{label}</span>{id === 'products' && <span className="nav-count">{data.products.length}</span>}{id === 'dashboard' && <span className="nav-active-dot" />}</button>)}</nav>
+      <div className="sidebar-bottom"><button className={`documentation-link ${view === 'documentation' ? 'selected' : ''}`} onClick={() => navigate('documentation')}><FileText size={17} /><span>Документація API</span><ArrowRight size={14} /></button><div className="sidebar-status"><span className="live-dot" /><span>{updated ? 'Підключено до складу' : 'Завантаження даних'}</span><small>v1.1</small></div></div>
+    </aside>
+    <div className="workspace-main">
+      <header className="topbar" ref={headerRef}>
+        <div className="topbar-left"><button className="icon-button mobile-toggle" aria-label="Відкрити меню" onClick={() => setMobileMenu(true)}><Menu size={21} /></button><div className="current-date"><span className="date-mark" /><time dateTime={clock.toISOString()}>{date}</time></div></div>
+        <div className="topbar-actions"><button className="icon-button" aria-label="Оновити дані" title={updated ? `Оновлено ${dateTime(updated)}` : 'Оновити дані'} disabled={refreshing} onClick={() => run(refresh, 'Дані оновлено')}><RefreshCw size={17} className={refreshing ? 'spin' : ''} /></button><button className="icon-button" aria-label={dark ? 'Увімкнути світлу тему' : 'Увімкнути темну тему'} title="Змінити тему" onClick={() => updatePreference('theme', dark ? 'light' : 'dark')}>{dark ? <Sun size={18} /> : <Moon size={18} />}</button>
+          <div className="popup-anchor"><button className={`icon-button notification-button ${popup === 'notifications' ? 'pressed' : ''}`} aria-label={`Сповіщення${unread ? `: ${unread} нових` : ''}`} aria-expanded={popup === 'notifications'} onClick={() => setPopup(popup === 'notifications' ? null : 'notifications')}><Bell size={18} />{unread > 0 && <span className="notification-dot" />}</button>
+            {popup === 'notifications' && <section className="dropdown notifications"><div className="dropdown-title"><h2>Сповіщення {unread > 0 && <span className="count">{unread}</span>}</h2>{unread > 0 && <button className="icon-button" aria-label="Позначити всі прочитаними" title="Позначити всі прочитаними" onClick={() => markRead(notifications.map(p => p.notificationKey))}><CheckCheck size={17} /></button>}</div>{notifications.length ? <div className="notification-list">{notifications.map(p => <button key={p.id} className={`notification-item ${readNotifications[p.notificationKey] ? 'read' : ''}`} onClick={() => { markRead([p.notificationKey]); navigate('products', true); }}><span className="stat-icon amber"><AlertTriangle size={17} /></span><div><strong>{p.stock_quantity === 0 ? 'Товар закінчився' : 'Низький залишок'}</strong><p>{p.name}</p><small>{p.stock_quantity} од. · мінімум {p.min_stock_level}</small></div>{!readNotifications[p.notificationKey] && <i />}</button>)}</div> : <div className="notification-empty"><Bell size={29} /><strong>{preferences.notifications ? 'Усе під контролем' : 'Сповіщення вимкнені'}</strong><p>{preferences.notifications ? 'Товарів із низькими залишками немає.' : 'Їх можна увімкнути в налаштуваннях.'}</p></div>}<div className="dropdown-footer">Оновлюється разом із залишками складу</div></section>}
+          </div>
+          <div className="header-divider" />
+          <div className="popup-anchor"><button className="profile-button" aria-label="Меню профілю" aria-expanded={popup === 'profile'} onClick={() => setPopup(popup === 'profile' ? null : 'profile')}><span className="avatar">{user.first_name[0]}{user.last_name[0]}</span><span className="profile-name"><strong>{fullName(user)}</strong><small>{roles[user.role]}</small></span><ChevronDown size={14} /></button>
+            {popup === 'profile' && <div className="dropdown profile-dropdown"><div className="profile-dropdown-heading"><strong>{fullName(user)}</strong><small>{user.email}</small></div>{[['profile', UserRound, 'Мій профіль'], ['security', Shield, 'Налаштування безпеки'], ...(user.role === 'Admin' ? [['activity', Activity, 'Історія активності']] : [])].map(([id, Icon, label]) => <button key={id} onClick={() => navigate(id)}><Icon size={16} />{label}</button>)}<div className="dropdown-rule" /><button className="logout" onClick={logout}><LogOut size={16} />Вийти</button></div>}
+          </div>
+        </div>
+      </header>
+      <main className="main-content" id="main-content"><div className="content-wrap">{!loaded ? <div className="loading-data">{loadError ? <><AlertTriangle size={27} /><h2>Не вдалося завантажити склад</h2><p role="alert">{loadError}</p><Button onClick={() => run(refresh, 'Дані оновлено')}>Спробувати ще раз</Button></> : <><RefreshCw size={25} className="spin" /><h2>Завантажуємо дані складу</h2></>}</div> : <>{loadError && <p className="inline-error" role="alert">Не вдалося оновити дані: {loadError}. Показано останні завантажені записи.</p>}{content()}</>}<footer className="page-footer"><span>Sklad.io <span>·</span> Система складського обліку</span><span>{updated ? `Оновлено о ${new Intl.DateTimeFormat('uk-UA', { hour: '2-digit', minute: '2-digit', timeZone: 'Europe/Kyiv' }).format(updated)}` : 'Дані ще не завантажено'}</span></footer></div></main>
+    </div>
+    {modal && <Editor key={`${modal.kind}-${modal.record?.id || ''}`} modal={modal} close={closeModal} data={data} user={user} run={run} refresh={refresh} />}
+    {toast && <div className={`toast ${toast.error ? 'error' : ''}`} role={toast.error ? 'alert' : 'status'}>{toast.error ? <AlertTriangle size={19} /> : <Check size={19} />}<span>{toast.text}</span><button className="icon-button" aria-label="Закрити повідомлення" onClick={() => setToast(null)}><X size={16} /></button></div>}
+  </div>;
 }
-const blank={sku:'',name:'',category_id:1,price:'0.00',min_stock_level:5};
-export default function App(){
- const [user,setUser]=useState(null), [view,setView]=useState('products'), [items,setItems]=useState([]), [categories,setCategories]=useState([]), [error,setError]=useState(''), [notice,setNotice]=useState(''), [query,setQuery]=useState(''), [filter,setFilter]=useState(''), [form,setForm]=useState(null), [busy,setBusy]=useState(false);
- const writable=user && user.role!=='Manager';
- useEffect(()=>{ const reset=()=>setUser(null); window.addEventListener('unauthorized',reset); if(token) api('/auth/me').then(setUser).catch(e=>setError(e.message)); return ()=>window.removeEventListener('unauthorized',reset); },[]);
- useEffect(()=>{if(user){ api('/categories').then(setCategories).catch(e=>setError(e.message)); load(); }},[user,view,query,filter]);
- async function load(){setBusy(true);try{let path=view==='products'?'/products?q='+encodeURIComponent(query)+(filter?'&category_id='+filter:''):view==='reports'?'/reports/stock':'/'+view; const data=await api(path);setItems(view==='reports'?data.items:data);}catch(e){setError(e.message);}finally{setBusy(false);}}
- async function action(fn,refresh=true){setError('');setNotice('');setBusy(true);try{await fn();setNotice('Операцію виконано');if(refresh) await load();}catch(e){setError(e.message);}finally{setBusy(false);}}
- async function login(e){e.preventDefault();const data=new FormData(e.target);await action(async()=>{const r=await api('/auth/login','POST',Object.fromEntries(data));token=r.access_token;sessionStorage.setItem('sklad_token',token);setUser(await api('/auth/me'));});}
- async function save(e){e.preventDefault();const data=Object.fromEntries(new FormData(e.target));await action(async()=>{if(view==='products'){data.category_id=Number(data.category_id);data.min_stock_level=Number(data.min_stock_level);await api('/products'+(form.id?'/'+form.id:''),form.id?'PUT':'POST',data);}else if(view==='transactions'){data.product_id=Number(data.product_id);data.quantity=Number(data.quantity);await api('/transactions','POST',data);}else if(view==='users'){await api('/users','POST',data);}else{await api('/'+view,'POST',data);}setForm(null);});}
- if(!user)return <main className="login"><form onSubmit={login}><h1>Sklad<span>.io</span></h1><h2>Вхід у систему</h2><p>Інформаційна система обліку товарів на складі</p><label>Email<input name="email" type="email" required autoComplete="username"/></label><label>Пароль<input name="password" type="password" required autoComplete="current-password"/></label><button disabled={busy}>Увійти</button>{error&&<p role="alert">{error}</p>}</form></main>;
- return <div className="layout"><aside><h1>Sklad<span>.io</span></h1><p>Складський облік</p><nav>{[['products','Товари'],['transactions','Рух товарів'],['reports','Звіти'],['categories','Категорії'],['suppliers','Постачальники'],...(user.role==='Admin'?[['users','Користувачі'],['audit','Журнал подій']]:[])].map(([id,label])=><button className={view===id?'selected':''} key={id} onClick={()=>{setView(id);setForm(null);setError('');setNotice('');}}>{label}</button>)}</nav><footer>{user.first_name} {user.last_name}<br/>{user.role}<button onClick={()=>action(async()=>{await api('/auth/logout','POST');token=null;sessionStorage.removeItem('sklad_token');setUser(null);},false)}>Вийти</button></footer></aside><main><header><div><small>Професійна практика · Sklad.io</small><h2>{{products:'Облік товарів',transactions:'Рух товарів',reports:'Звіт про залишки',users:'Користувачі',categories:'Категорії',suppliers:'Постачальники',audit:'Журнал подій'}[view]}</h2></div>{writable&&!['reports','audit'].includes(view)&&<button onClick={()=>setForm(view==='products'?blank:{})}>Додати</button>}</header>
- {error&&<p role="alert">{error}</p>}{notice&&<p role="status">{notice}</p>}
- {view==='products'&&<div className="toolbar"><input aria-label="Пошук товарів" placeholder="Назва або артикул" value={query} onChange={e=>setQuery(e.target.value)}/><select aria-label="Категорія" value={filter} onChange={e=>setFilter(e.target.value)}><option value="">Усі категорії</option>{categories.map(c=><option key={c.id} value={c.id}>{c.name}</option>)}</select></div>}
- {view==='reports'&&<div className="toolbar"><button onClick={()=>action(async()=>setItems((await api('/reports/stock')).items),false)}>Усі залишки</button><button onClick={()=>action(async()=>{const r=await api('/reports/low-stock');setItems(r.items);},false)}>Низькі залишки</button><button onClick={()=>{const b=new Blob([JSON.stringify(items,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='stock-report.json';a.click();URL.revokeObjectURL(a.href);}}>Завантажити JSON</button></div>}
- {busy&&<p>Виконується запит…</p>}
- <div className="table"><table><thead><tr>{(view==='products'?['Артикул','Назва','Ціна ₴','Залишок','Мінімум','Дії']:view==='reports'?['Артикул','Назва','Залишок','Вартість ₴']:view==='transactions'?['ID','Товар ID','Тип','Кількість','Дата','Примітки']:view==='users'?['ID','Email','Ім’я','Прізвище','Роль']:view==='audit'?['ID','Користувач ID','Подія','Дата']:['ID','Назва']).map(x=><th key={x}>{x}</th>)}</tr></thead><tbody>{items.map((p,i)=><tr key={p.id||p.sku||i}>{(view==='products'?[p.sku,p.name,p.price,p.stock_quantity,p.min_stock_level]:view==='reports'?[p.sku,p.name,p.stock,p.value]:view==='transactions'?[p.id,p.product_id,p.type,p.quantity,p.transaction_date,p.notes]:view==='users'?[p.id,p.email,p.first_name,p.last_name,p.role]:view==='audit'?[p.id,p.user_id,p.action,p.created_at]:[p.id,p.name]).map((x,j)=><td key={j}>{x}</td>)}{view==='products'&&<td>{writable&&<button onClick={()=>setForm(p)}>Змінити</button>}{user.role==='Admin'&&<button onClick={()=>{if(confirm('Видалити '+p.name+'?'))action(()=>api('/products/'+p.id,'DELETE'));}}>Видалити</button>}</td>}</tr>)}</tbody></table>{!items.length&&!busy&&<p>Записів немає</p>}</div>
- {form&&<div className="backdrop"><form className="modal" onSubmit={save}><h2>{form.id?'Редагування':'Новий запис'}</h2>{(view==='products'?[['sku','Артикул','text'],['name','Назва','text'],['category_id','Категорія','category'],['price','Ціна','number'],['min_stock_level','Мінімальний запас','number']]:view==='transactions'?[['product_id','ID товару','number'],['type','Тип руху','movement'],['quantity','Кількість','number'],['notes','Примітки','text']]:view==='users'?[['email','Email','email'],['password','Пароль','password'],['first_name','Ім’я','text'],['last_name','Прізвище','text'],['role','Роль','role']]:[['name','Назва','text']]).map(([name,label,type])=><label key={name}>{label}{['category','movement','role'].includes(type)?<select name={name} defaultValue={form[name]}>{(type==='category'?categories.map(c=>[c.id,c.name]):type==='movement'?[['IN','Надходження'],['OUT','Списання']]:[['Manager','Менеджер'],['Storekeeper','Комірник'],['Admin','Адміністратор']]).map(([value,text])=><option key={value} value={value}>{text}</option>)}</select>:<input required={name!=='notes'} name={name} type={type} min={type==='number'?(name==='quantity'||name==='product_id'?1:0):undefined} step={name==='price'?'0.01':type==='number'?'1':undefined} defaultValue={form[name]??''}/>}</label>)}<div className="toolbar"><button type="button" onClick={()=>setForm(null)}>Скасувати</button><button disabled={busy}>Зберегти</button></div></form></div>}
- </main></div>;
+
+function Brand() { return <div className="brand"><span className="brand-icon"><Box size={22} strokeWidth={2} /></span><span>Sklad<span className="brand-accent">.io</span></span></div>; }
+
+function Login({ dark, toggleTheme, onLogin, message }) {
+  const [busy, setBusy] = useState(false), [error, setError] = useState(''), [visible, setVisible] = useState(false);
+  async function submit(event) {
+    event.preventDefault(); setBusy(true); setError('');
+    try { const auth = await request('/auth/login', 'POST', Object.fromEntries(new FormData(event.target))); sessionStorage.setItem('sklad_token', auth.access_token); onLogin(await request('/auth/me')); }
+    catch (e) { setError(e.message); } finally { setBusy(false); }
+  }
+  return <main className="login-page"><div className="login-top"><Brand /><button className="icon-button" aria-label={dark ? 'Увімкнути світлу тему' : 'Увімкнути темну тему'} onClick={toggleTheme}>{dark ? <Sun size={20} /> : <Moon size={20} />}</button></div><div className="login-center"><div className="login-badge"><Box size={29} strokeWidth={1.6} /></div><div className="eyebrow">ВАШ РОБОЧИЙ ПРОСТІР</div><h1>Вхід у систему</h1><p>Раді бачити вас знову. Увійдіть, щоб продовжити.</p><form className="login-card" onSubmit={submit}>{message && <div className="login-info" role="status">{message}</div>}{error && <div className="inline-error" role="alert">{error}</div>}<label className="field"><span>Email адреса</span><input name="email" type="email" required autoComplete="username" placeholder="you@company.com" /></label><label className="field"><span>Пароль</span><div className="password-input"><input name="password" type={visible ? 'text' : 'password'} required autoComplete="current-password" placeholder="Введіть ваш пароль" /><button type="button" className="icon-button" aria-label={visible ? 'Приховати пароль' : 'Показати пароль'} onClick={() => setVisible(!visible)}>{visible ? <EyeOff size={17} /> : <Eye size={17} />}</button></div></label><Button type="submit" variant="primary" busy={busy}>Увійти до робочого простору <ArrowRight size={17} /></Button><div className="login-protected"><Shield size={14} />Захищений доступ до вашого складу</div></form><p className="login-help">Потрібен обліковий запис? Зверніться до адміністратора.</p></div><footer className="login-footer"><span>© {new Date().getFullYear()} Sklad.io</span><span>Професійна практика · ІПЗ-41</span></footer></main>;
 }
